@@ -206,7 +206,15 @@ backend-selection overview.
 
    :Type: ``int`` (0 or 1)
    :Default: ``1``
-   :Description: Allow non-deterministic algorithms for Transformer Engine execution. When set to ``0``, only deterministic algorithms are allowed. This is relevant for both PyTorch and JAX attention implementations.
+   :Description: Allow non-deterministic algorithms for Transformer Engine execution. When set to ``0``, only deterministic algorithms are allowed. This is relevant for both PyTorch and JAX attention implementations. In PyTorch it is also the single knob for the CuTe DSL fused grouped MLP: it disables that op's CuTe DSL grouped-GEMM wgrad kernel, which accumulates ``dW`` across its K-split with cross-CTA atomic adds, in favor of the slower but fixed-order cuBLAS grouped wgrad GEMM.
+
+   .. note::
+
+      This variable does not reach inside cuDNN. The cuDNN grouped-GEMM dactivation
+      backward used by the CuTe DSL fused grouped MLP accumulates the scale gradient
+      (``dprob``) with cross-CTA atomic adds, so that op is bit-exact only with a cuDNN
+      that reduces ``dprob`` deterministically. Transformer Engine emits a warning when
+      this path runs under ``NVTE_ALLOW_NONDETERMINISTIC_ALGO=0``.
 
 .. envvar:: NVTE_FUSED_RING_ATTENTION_USE_SCAN
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 import functools
 import os
+import warnings
 from importlib.metadata import PackageNotFoundError, version as get_pkg_version
 from typing import Any, Optional
 
@@ -348,6 +349,32 @@ def _grouped_gemm_dsrelu_backward_supported() -> bool:
     except ImportError:
         return False
     return grouped_gemm_dsrelu_wrapper_sm100 is not None
+
+
+def _deterministic_algorithms_required() -> bool:
+    """Whether the user has asked for bit-exact reproducibility.
+
+    Same check as ``transformer_engine.pytorch.triton.grouped_dbias_dscales``.
+    Deliberately uncached so tests can flip the variable.
+    """
+    return not bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")))
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_nondeterministic_cudnn_dprob() -> None:
+    """Warn once per process that determinism does not reach into cuDNN.
+
+    Cached because the call site runs on every backward pass.
+    """
+    warnings.warn(
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 selects deterministic kernels inside"
+        " Transformer Engine, but it cannot reach inside the cuDNN grouped-GEMM"
+        " dactivation backward that the CuTe DSL fused grouped MLP calls. That kernel"
+        " accumulates the scale gradient (dprob) with cross-CTA atomic adds whose"
+        " summation order is set by the tile scheduler, so this op is bit-exact only"
+        " when the installed cuDNN reduces dprob deterministically.",
+        UserWarning,
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -896,10 +923,16 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
     def grouped_gemm_wgrad_kernel(cls) -> Optional[Callable]:
         """CuTe DSL kernel for grouped GEMM wgrad on SM100+.
 
-        Returns ``None`` when the environment variable
-        ``NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP`` is set to ``1``.
+        Returns ``None`` under ``NVTE_ALLOW_NONDETERMINISTIC_ALGO=0``, so the caller falls
+        back to the deterministic cuBLAS grouped wgrad GEMM. This kernel accumulates ``dW``
+        across its K-split with cross-CTA atomic adds, so its floating-point summation
+        order follows CTA scheduling and varies run to run.
+
+        The fallback is measurably slower on large MoE workloads. Making the fused kernel
+        itself deterministic -- a ``grid_k`` slot per writer plus a canonical reduce, as
+        cuDNN's ``dprob`` epilogue needs -- would remove the need for it.
         """
-        if int(os.environ.get("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "0")) >= 1:
+        if _deterministic_algorithms_required():
             return None
         from cudnn import grouped_gemm_wgrad_wrapper_sm100  # pylint: disable=no-name-in-module
 
@@ -1951,6 +1984,10 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             scales_f32 = scales.detach().to(dtype=torch.float32)
             scales_tensor = scales_f32.reshape(-1, 1, 1)
             dscales_tensor = torch.zeros_like(scales_tensor)
+            if _deterministic_algorithms_required():
+                # Warn only where dprob is actually produced: with a unit activation
+                # scale the cuDNN epilogue never runs its atomic dprob accumulation.
+                _warn_nondeterministic_cudnn_dprob()
 
         fc2_d_dtype = torch.bfloat16 if use_nvfp4 else torch.float8_e4m3fn
         if use_nvfp4:
